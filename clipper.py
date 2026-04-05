@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════════╗
+║            YOUTUBE AUTO CLIPPER PIPELINE  v2                  ║
+║                                                               ║
+║  Usage (single video):                                        ║
+║    python clipper.py <url>                                    ║
+║                                                               ║
+║  Usage (multi video - digabung):                              ║
+║    python clipper.py <url1> <url2> <url3>                     ║
+║                                                               ║
+║  Usage (dengan context/arahan):                               ║
+║    python clipper.py <url> --context "fokus tips investasi"   ║
+║    python clipper.py <url1> <url2> --context "cari momen lucu"║
+║                                                               ║
+║  Output per session:                                          ║
+║    clips/        → video clips final siap review              ║
+║    REVIEW_CHECKLIST.md → checklist + draft judul/deskripsi    ║
+║    transcript.json / analysis.json → data lengkap             ║
+╚═══════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import sys
+
+# ── Auto-relaunch with venv Python if running under system Python ──────────
+_VENV_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "venv", "bin", "python3")
+if os.path.exists(_VENV_PY) and os.path.abspath(sys.executable) != os.path.abspath(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY] + sys.argv)
+# ───────────────────────────────────────────────────────────────────────────
+import json
+import argparse
+from datetime import datetime
+
+from modules.downloader import download_video, download_multiple
+from modules.transcriber import transcribe_video
+from modules.analyzer import analyze_transcript, analyze_multi_transcripts
+from modules.tts_engine import generate_clip_voiceovers
+from modules.video_editor import create_clip
+
+import config
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="YouTube Auto Clipper",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "urls",
+        nargs="*",
+        help="YouTube URL(s). Satu atau lebih, pisahkan dengan spasi."
+    )
+    parser.add_argument(
+        "--context", "-c",
+        type=str,
+        default="",
+        help=(
+            "Konteks/arahan untuk AI. Contoh:\n"
+            '  --context "fokus tips investasi"\n'
+            '  --context "cari momen lucu dan mengejutkan"\n'
+            '  --context "highlight insight tentang startup"'
+        )
+    )
+    return parser.parse_args()
+
+
+def main():
+    print_banner()
+    args = parse_args()
+
+    # ─── Kumpulkan URL ────────────────────────────────────
+    urls = args.urls
+    context = args.context.strip()
+
+    # Default context jika tidak diisi
+    if not context:
+        context = (
+            "Cari momen paling menarik dan berpotensi viral: "
+            "insight mengejutkan, pernyataan kontroversial, momen lucu, "
+            "cerita emosional, tips praktis, atau fakta menarik yang bikin penonton penasaran. "
+            "Pilih yang paling engaging dan bisa berdiri sendiri sebagai konten pendek."
+        )
+        print(f"\n💡 Menggunakan default context (cari momen viral terbaik)")
+
+    if not urls:
+        raw = input("\n🔗 Paste YouTube URL (bisa lebih dari satu, pisahkan spasi):\n> ").strip()
+        urls = [u.strip() for u in raw.split() if u.strip()]
+
+    # Validasi
+    valid_urls = []
+    for u in urls:
+        if "youtube.com" in u or "youtu.be" in u:
+            valid_urls.append(u)
+        else:
+            print(f"⚠️  Bukan URL YouTube, dilewati: {u}")
+
+    if not valid_urls:
+        print("❌ Tidak ada URL YouTube yang valid.")
+        sys.exit(1)
+
+    is_multi = len(valid_urls) > 1
+
+    if context:
+        print(f"\n🎯 Context: {context}")
+    if is_multi:
+        print(f"🔗 Multi-video mode: {len(valid_urls)} video akan digabung")
+
+    # ─── Validate API key ─────────────────────────────────
+    api_key = get_api_key()
+    if not api_key:
+        print("❌ API key belum diisi! Edit config.py dan isi OPENAI_API_KEY atau ANTHROPIC_API_KEY")
+        sys.exit(1)
+
+    # ─── Setup session dir ────────────────────────────────
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(config.OUTPUT_DIR, f"session_{timestamp}")
+    os.makedirs(session_dir, exist_ok=True)
+    print(f"\n📁 Output: {os.path.abspath(session_dir)}")
+
+    # ═════════════════════════════════════════════════════
+    # STEP 1: Download Video(s)
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print(f"📥 STEP 1: Download {'Videos' if is_multi else 'Video'}")
+    print("=" * 60)
+
+    download_base = os.path.join(session_dir, "source")
+
+    if is_multi:
+        videos_meta = download_multiple(
+            urls=valid_urls,
+            output_base_dir=download_base,
+            preferred_quality=config.PREFERRED_QUALITY
+        )
+        if not videos_meta:
+            print("❌ Semua video gagal di-download.")
+            sys.exit(1)
+        # Gunakan video pertama sebagai primary untuk thumbnail
+        primary_meta = videos_meta[0]
+    else:
+        primary_meta = download_video(
+            url=valid_urls[0],
+            output_dir=download_base,
+            preferred_quality=config.PREFERRED_QUALITY
+        )
+        primary_meta["source_index"] = 1
+        videos_meta = [primary_meta]
+
+    # Cek durasi
+    for vm in videos_meta:
+        if vm["duration"] > config.MAX_VIDEO_DURATION:
+            print(f"⚠️  Video '{vm['title']}' terlalu panjang, dilewati.")
+            videos_meta = [v for v in videos_meta if v != vm]
+
+    if not videos_meta:
+        print("❌ Tidak ada video yang valid.")
+        sys.exit(1)
+
+    # ═════════════════════════════════════════════════════
+    # STEP 2: Transcribe All Videos
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("🎙️  STEP 2: Transkripsi Audio")
+    print("=" * 60)
+
+    transcripts = []
+    for vm in videos_meta:
+        print(f"\n  Transkripsi: {vm['title']}")
+        transcript_dir = os.path.join(session_dir, f"transcript_{vm['source_index']:02d}")
+        t = transcribe_video(
+            video_path=vm["video_path"],
+            output_dir=transcript_dir,
+            model_size=config.WHISPER_MODEL,
+            language=config.WHISPER_LANGUAGE,
+            device=config.WHISPER_DEVICE
+        )
+        transcripts.append(t)
+
+    # ═════════════════════════════════════════════════════
+    # STEP 3: AI Analysis
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("🧠 STEP 3: AI Analisis - Cari Momen Penting")
+    print("=" * 60)
+
+    if is_multi:
+        clips_data = analyze_multi_transcripts(
+            transcripts=transcripts,
+            videos_meta=videos_meta,
+            max_clips=config.MAX_CLIPS,
+            clip_min_duration=config.CLIP_MIN_DURATION,
+            clip_max_duration=config.CLIP_MAX_DURATION,
+            provider=config.LLM_PROVIDER,
+            api_key=api_key,
+            model=config.LLM_MODEL,
+            context=context
+        )
+    else:
+        clips_data = analyze_transcript(
+            transcript=transcripts[0],
+            video_meta=videos_meta[0],
+            max_clips=config.MAX_CLIPS,
+            clip_min_duration=config.CLIP_MIN_DURATION,
+            clip_max_duration=config.CLIP_MAX_DURATION,
+            provider=config.LLM_PROVIDER,
+            api_key=api_key,
+            model=config.LLM_MODEL,
+            context=context
+        )
+
+    if not clips_data:
+        print("❌ Tidak ditemukan momen penting. Coba URL atau context lain.")
+        sys.exit(1)
+
+    # Simpan analysis
+    with open(os.path.join(session_dir, "analysis.json"), "w", encoding="utf-8") as f:
+        json.dump(clips_data, f, ensure_ascii=False, indent=2)
+
+    # ═════════════════════════════════════════════════════
+    # STEP 4: Generate Voiceovers
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("🔊 STEP 4: Generate Voiceover (Intro & Outro)")
+    print("=" * 60)
+
+    voiceover_dir = os.path.join(session_dir, "voiceovers")
+    voiceovers = {}
+    for clip in clips_data:
+        vo = generate_clip_voiceovers(
+            clip_data=clip,
+            output_dir=voiceover_dir,
+            voice=config.TTS_VOICE,
+            rate=config.TTS_RATE,
+            outro_cta_text=config.OUTRO_CTA_TEXT
+        )
+        voiceovers[clip["clip_number"]] = vo
+
+    # ═════════════════════════════════════════════════════
+    # STEP 5: Create Video Clips
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("🎬 STEP 5: Membuat Video Clips")
+    print("=" * 60)
+
+    clips_dir = os.path.join(session_dir, "clips")
+    final_clips = []
+
+    for clip in clips_data:
+        clip_num = clip["clip_number"]
+        vo_data = voiceovers.get(clip_num, {})
+
+        # Tentukan video sumber untuk multi-video mode
+        src_video_idx = clip.get("source_video", 1)
+        src_meta = next(
+            (v for v in videos_meta if v.get("source_index") == src_video_idx),
+            videos_meta[0]
+        )
+        src_transcript = transcripts[videos_meta.index(src_meta)] if src_meta in videos_meta else transcripts[0]
+
+        clip_path = create_clip(
+            video_path=src_meta["video_path"],
+            clip_data=clip,
+            voiceover_data=vo_data,
+            transcript_segments=src_transcript["segments"],
+            output_dir=clips_dir,
+            thumbnail_path=src_meta.get("thumbnail_path", ""),
+            clip_format=config.CLIP_FORMAT,
+            subtitle_font_size=config.SUBTITLE_FONT_SIZE,
+            subtitle_color=config.SUBTITLE_FONT_COLOR,
+            subtitle_bg=config.SUBTITLE_BG_COLOR,
+            brand_text=config.BRAND_TEXT,
+            brand_position=config.BRAND_POSITION,
+            logo_path=config.LOGO_PATH,
+            logo_size=config.LOGO_SIZE,
+            logo_position=config.LOGO_POSITION,
+            logo_opacity=config.LOGO_OPACITY,
+            outro_cta_text=config.OUTRO_CTA_TEXT,
+            outro_duration=config.OUTRO_DURATION
+        )
+
+        final_clips.append({
+            "clip_number": clip_num,
+            "path": clip_path,
+            "source_video": src_video_idx,
+            "data": clip
+        })
+
+    # ═════════════════════════════════════════════════════
+    # STEP 6: Review Package
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("📋 STEP 6: Membuat Review Package")
+    print("=" * 60)
+
+    generate_review_package(session_dir, videos_meta, clips_data, final_clips, context)
+
+    # ═════════════════════════════════════════════════════
+    # DONE
+    # ═════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("✅ SELESAI!")
+    print("=" * 60)
+    print(f"\n📁 Folder hasil : {os.path.abspath(session_dir)}")
+    print(f"📋 Review checklist : {os.path.join(os.path.abspath(session_dir), 'REVIEW_CHECKLIST.md')}")
+    print(f"🎬 Total clips      : {len(final_clips)}")
+    print(f"\n💡 LANGKAH SELANJUTNYA:")
+    print(f"   1. Tonton tiap clip di folder clips/")
+    print(f"   2. (Opsional) Rekam ulang voiceover dengan suara sendiri")
+    print(f"   3. Tambah logo/watermark jika belum")
+    print(f"   4. Buat thumbnail custom")
+    print(f"   5. Edit judul & deskripsi di REVIEW_CHECKLIST.md")
+    print(f"   6. Upload manual ke YouTube (maks 2-3/hari)")
+
+
+def generate_review_package(session_dir: str, videos_meta: list,
+                            clips_data: list, final_clips: list,
+                            context: str = ""):
+    """Generate markdown review checklist."""
+    checklist_path = os.path.join(session_dir, "REVIEW_CHECKLIST.md")
+
+    lines = [
+        "# 📋 Review Checklist - YouTube Clipper",
+        "",
+    ]
+
+    if len(videos_meta) > 1:
+        lines += ["## Video Sumber", ""]
+        for vm in videos_meta:
+            lines.append(f"- **Video {vm.get('source_index', '?')}:** [{vm.get('title', '?')}]({vm.get('url', '')})")
+        lines.append("")
+    else:
+        vm = videos_meta[0]
+        lines += [
+            f"**Video Asli:** {vm.get('title', 'Unknown')}",
+            f"**Channel:** {vm.get('channel', 'Unknown')}",
+            f"**URL:** {vm.get('url', '')}",
+        ]
+
+    if context:
+        lines.append(f"**Context:** {context}")
+
+    lines += [
+        f"**Generate:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "---",
+        "",
+        "## Clips",
+        "",
+    ]
+
+    for clip in clips_data:
+        num = clip["clip_number"]
+        duration = clip["end_time"] - clip["start_time"]
+        src = clip.get("source_video", "")
+        src_label = f" (Video {src})" if src and len(videos_meta) > 1 else ""
+
+        lines += [
+            f"### Clip #{num}{src_label}: {clip['title']}",
+            "",
+            f"| Field | Value |",
+            f"|-------|-------|",
+            f"| Durasi | {duration:.0f} detik |",
+            f"| Viral Score | {clip.get('viral_score', '?')}/10 |",
+            f"| File | `clips/clip_{num:02d}/FINAL_clip_{num:02d}.mp4` |",
+            "",
+            f"**Poin Utama:**",
+            f"> {clip.get('key_point', '')}",
+            "",
+            f"**Draft Judul:**",
+            f"> {clip['title']}",
+            "",
+            f"**Hook (3 detik pertama):**",
+            f"> {clip.get('hook', '')}",
+            "",
+            f"**Commentary Intro** *(AI draft — ganti dengan voiceover sendiri)*:",
+            f"> {clip.get('commentary_intro', '')}",
+            "",
+            f"**Commentary Outro:**",
+            f"> {clip.get('commentary_outro', '')}",
+            "",
+            f"**Tags:** `{'` `'.join(clip.get('tags', []))}`",
+            "",
+            "**Checklist sebelum upload:**",
+            "- [ ] Tonton clip — potongan natural di awal & akhir?",
+            "- [ ] Subtitle akurat? Koreksi nama/istilah yang salah",
+            "- [ ] Intro: thumbnail + hook text menarik?",
+            "- [ ] Outro: CTA text terlihat jelas?",
+            "- [ ] (Opsional) Rekam voiceover sendiri untuk intro & outro",
+            "- [ ] Buat thumbnail custom",
+            "- [ ] Finalisasi judul",
+            "- [ ] Tulis deskripsi + credit channel asli",
+            "",
+            "**Status:** ⬜ Belum | 🟡 Perlu Edit | ✅ Siap Upload",
+            "",
+            "---",
+            "",
+        ]
+
+    lines += [
+        "## 💡 Tips Sentuhan Personal",
+        "",
+        "1. **Voiceover** — AI voiceover cukup untuk draft. Rekam ulang dengan suara sendiri untuk hasil lebih personal.",
+        "2. **Thumbnail** — Buat custom dengan Canva/Photoshop. Jangan pakai frame video mentah.",
+        "3. **Judul** — Buat curiosity gap. Jangan sama persis dengan video asli.",
+        "4. **Deskripsi** — Selalu cantumkan credit channel asli + link video sumber.",
+        "5. **Upload** — Maksimal 2-3 clip/hari. Bulk upload memicu review manual YouTube.",
+        "",
+        "## ⚙️ Config yang Dipakai",
+        "",
+        f"- TTS Voice: `{config.TTS_VOICE}`",
+        f"- Outro CTA: `{config.OUTRO_CTA_TEXT}`",
+        f"- Logo: `{config.LOGO_PATH or '(tidak ada)'}`",
+        f"- Format: `{config.CLIP_FORMAT}` ({config.CLIP_MIN_DURATION}-{config.CLIP_MAX_DURATION}s)",
+    ]
+
+    with open(checklist_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"    Review checklist: {checklist_path}")
+
+    # Save session metadata
+    meta_path = os.path.join(session_dir, "session_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "videos": videos_meta,
+            "context": context,
+            "clips_count": len(clips_data),
+            "clips": clips_data,
+            "generated_at": datetime.now().isoformat()
+        }, f, ensure_ascii=False, indent=2)
+
+
+def get_api_key() -> str:
+    if config.LLM_PROVIDER == "openai":
+        return config.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
+    elif config.LLM_PROVIDER == "anthropic":
+        return config.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
+    return ""
+
+
+def print_banner():
+    print("""
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║    🎬  YOUTUBE AUTO CLIPPER  v2                               ║
+║                                                               ║
+║    Single video:                                              ║
+║      python clipper.py <url>                                  ║
+║                                                               ║
+║    Multi video (digabung):                                    ║
+║      python clipper.py <url1> <url2> <url3>                   ║
+║                                                               ║
+║    Dengan context/arahan:                                     ║
+║      python clipper.py <url> --context "fokus tips bisnis"    ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+    """)
+
+
+if __name__ == "__main__":
+    main()

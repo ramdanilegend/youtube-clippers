@@ -40,7 +40,8 @@ def create_clip(video_path: str, clip_data: dict, voiceover_data: dict,
                 logo_position: str = "top-left",
                 logo_opacity: float = 0.8,
                 outro_cta_text: str = "",
-                outro_duration: float = 4.0) -> str:
+                outro_duration: float = 4.0,
+                compile_mode: bool = False) -> str:
     """
     Buat satu clip lengkap dengan:
     - Intro: thumbnail blur + voiceover + hook text + logo
@@ -141,8 +142,16 @@ def create_clip(video_path: str, clip_data: dict, voiceover_data: dict,
             print(f"    [ERROR] Tidak ada clip yang bisa digunakan untuk clip #{clip_num}")
             return ""
 
-    # ─── Step 5: Buat intro & outro video ──────────────────
-    print("    [5/6] Membuat intro & outro dengan thumbnail...")
+    # ─── compile_mode: return styled clip only (no intro/merge) ──────────
+    if compile_mode:
+        for temp in [raw_clip, cropped_clip]:
+            if os.path.exists(temp) and temp != styled_clip:
+                safe_remove(temp)
+        print(f"    Segment #{clip_num} siap: {styled_clip}")
+        return styled_clip
+
+    # ─── Step 5: Buat intro video ─────────────────────────
+    print("    [5/6] Membuat intro dengan creative card...")
     intro_video = create_intro_video(
         clip_dir=clip_dir,
         thumbnail_path=thumbnail_path,
@@ -155,23 +164,10 @@ def create_clip(video_path: str, clip_data: dict, voiceover_data: dict,
         res_w=res_w, res_h=res_h
     )
 
-    outro_video = create_outro_video(
-        clip_dir=clip_dir,
-        thumbnail_path=thumbnail_path,
-        voiceover_data=voiceover_data,
-        cta_text=outro_cta_text,
-        logo_path=logo_path,
-        logo_size=logo_size,
-        logo_position=logo_position,
-        logo_opacity=logo_opacity,
-        outro_duration=outro_duration,
-        res_w=res_w, res_h=res_h
-    )
-
-    # ─── Step 6: Merge intro + clip + outro ────────────────
+    # ─── Step 6: Merge intro + clip ────────────────────────
     print("    [6/6] Menggabungkan semua bagian...")
     final_clip = os.path.join(clip_dir, f"FINAL_clip_{clip_num:02d}.mp4")
-    merge_parts(intro_video, styled_clip, outro_video, final_clip)
+    merge_parts(intro_video, styled_clip, "", final_clip)
 
     # Cleanup
     for temp in [raw_clip, cropped_clip]:
@@ -182,62 +178,241 @@ def create_clip(video_path: str, clip_data: dict, voiceover_data: dict,
     return final_clip
 
 
+def _render_intro_card(hook_text: str, intro_text: str,
+                       thumbnail_path: str,
+                       res_w: int, res_h: int,
+                       output_png: str) -> bool:
+    """
+    Render a creative intro card as a full-resolution PNG using Pillow.
+
+    Layout (top → bottom):
+      • Blurred/darkened thumbnail background (or dark gradient)
+      • Vignette overlay (dark edges)
+      • Yellow accent bar at top
+      • "● VIRAL CLIP" badge
+      • Hook text — large, bold, word-level color (yellow = keyword, white = normal)
+      • Thin divider line
+      • Intro commentary text — medium, white, word-wrapped
+      • Bottom hint arrow
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+
+    # ── Background ────────────────────────────────────────────────────────
+    if thumbnail_path and os.path.exists(thumbnail_path):
+        try:
+            bg = Image.open(thumbnail_path).convert("RGB")
+            ratio = max(res_w / bg.width, res_h / bg.height)
+            new_w = int(bg.width * ratio)
+            new_h = int(bg.height * ratio)
+            bg = bg.resize((new_w, new_h), Image.LANCZOS)
+            left = (new_w - res_w) // 2
+            top  = (new_h - res_h) // 2
+            bg   = bg.crop((left, top, left + res_w, top + res_h))
+            bg   = bg.filter(ImageFilter.GaussianBlur(radius=28))
+            bg   = bg.point(lambda p: int(p * 0.28))   # heavy darken
+        except Exception:
+            bg = Image.new("RGB", (res_w, res_h), (10, 10, 22))
+    else:
+        bg = Image.new("RGB", (res_w, res_h), (10, 10, 22))
+
+    card = bg.convert("RGBA")
+
+    # ── Vignette overlay ──────────────────────────────────────────────────
+    vig = Image.new("RGBA", (res_w, res_h), (0, 0, 0, 0))
+    dv  = ImageDraw.Draw(vig)
+    # Top 45% gradient (dark → transparent)
+    for y in range(int(res_h * 0.45)):
+        a = int(200 * (1 - y / (res_h * 0.45)))
+        dv.line([(0, y), (res_w, y)], fill=(0, 0, 0, a))
+    # Bottom 45% gradient (transparent → dark)
+    for y in range(int(res_h * 0.55), res_h):
+        a = int(200 * (y - res_h * 0.55) / (res_h * 0.45))
+        dv.line([(0, y), (res_w, y)], fill=(0, 0, 0, a))
+    card = Image.alpha_composite(card, vig)
+
+    draw = ImageDraw.Draw(card)
+
+    # ── Fonts ─────────────────────────────────────────────────────────────
+    font_hook    = _load_subtitle_font(76)   # large bold hook
+    font_body    = _load_subtitle_font(38)   # intro commentary
+    font_badge   = _load_subtitle_font(28)   # badge text
+    font_arrow   = _load_subtitle_font(48)   # bottom arrow hint
+
+    PAD = 60   # horizontal padding
+
+    # ── Yellow accent bar (top) ───────────────────────────────────────────
+    bar_y = 72
+    draw.rectangle([(0, bar_y), (res_w, bar_y + 7)], fill=(255, 210, 0, 255))
+
+    # ── "● VIRAL CLIP" badge ──────────────────────────────────────────────
+    badge_text = "● VIRAL CLIP"
+    badge_y    = bar_y + 26
+    try:
+        bb = draw.textbbox((0, 0), badge_text, font=font_badge)
+        bw = bb[2] - bb[0] + 28
+        bh = bb[3] - bb[1] + 14
+    except Exception:
+        bw, bh = 160, 40
+    bx = PAD
+    draw.rounded_rectangle([(bx, badge_y), (bx + bw, badge_y + bh)],
+                            radius=8, fill=(255, 30, 30, 220))
+    draw.text((bx + 14, badge_y + 7), badge_text, font=font_badge,
+              fill=(255, 255, 255, 255))
+
+    # ── Hook text (word-level keyword highlight) ──────────────────────────
+    # Wrap into lines of max ~4 words each
+    hook_words = (hook_text or "").split()
+    words_per_line = 4
+    hook_lines = [hook_words[i:i + words_per_line]
+                  for i in range(0, len(hook_words), words_per_line)]
+
+    # Measure total hook block height to center it vertically (~38-55% from top)
+    line_h = int(76 * 1.35)
+    total_hook_h = len(hook_lines) * line_h
+    hook_start_y = int(res_h * 0.30) - total_hook_h // 2
+
+    outline_px = 4
+
+    def draw_word_row(words_in_line, y):
+        """Draw one row of words with per-word keyword coloring, centered."""
+        # Pre-measure each word to find total line width
+        parts = []
+        space_w = 18
+        total_w = 0
+        for idx, wd in enumerate(words_in_line):
+            try:
+                wb = draw.textbbox((0, 0), wd, font=font_hook)
+                ww = wb[2] - wb[0]
+            except Exception:
+                ww = len(wd) * 38
+            parts.append((wd, ww, _is_keyword(wd)))
+            total_w += ww
+            if idx < len(words_in_line) - 1:
+                total_w += space_w
+
+        x = (res_w - total_w) // 2
+        for wd, ww, is_kw in parts:
+            fg = (255, 215, 0, 255) if is_kw else (255, 255, 255, 255)
+            # Black outline
+            for dx in range(-outline_px, outline_px + 1):
+                for dy in range(-outline_px, outline_px + 1):
+                    if dx != 0 or dy != 0:
+                        draw.text((x + dx, y + dy), wd, font=font_hook,
+                                  fill=(0, 0, 0, 255))
+            # Drop shadow
+            draw.text((x + 3, y + 4), wd, font=font_hook, fill=(0, 0, 0, 180))
+            # Main word
+            draw.text((x, y), wd, font=font_hook, fill=fg)
+            x += ww + space_w
+
+    for li, line_words in enumerate(hook_lines):
+        draw_word_row(line_words, hook_start_y + li * line_h)
+
+    # ── Divider line ──────────────────────────────────────────────────────
+    div_y = hook_start_y + total_hook_h + 28
+    div_pad = 120
+    draw.line([(div_pad, div_y), (res_w - div_pad, div_y)],
+              fill=(255, 210, 0, 180), width=3)
+
+    # ── Intro commentary text (word-wrapped) ──────────────────────────────
+    body_text = (intro_text or "").strip()
+    if body_text:
+        body_words = body_text.split()
+        # Wrap to fit within (res_w - 2*PAD) width
+        max_line_w = res_w - PAD * 2
+        body_lines = []
+        current_line = []
+        current_w    = 0
+        sp_w = 14
+        for wd in body_words:
+            try:
+                wb = draw.textbbox((0, 0), wd, font=font_body)
+                ww = wb[2] - wb[0]
+            except Exception:
+                ww = len(wd) * 18
+            if current_line and current_w + sp_w + ww > max_line_w:
+                body_lines.append(" ".join(current_line))
+                current_line = [wd]
+                current_w    = ww
+            else:
+                current_line.append(wd)
+                current_w += (sp_w if current_line else 0) + ww
+        if current_line:
+            body_lines.append(" ".join(current_line))
+
+        body_line_h = int(38 * 1.45)
+        body_y      = div_y + 36
+        for ln in body_lines[:5]:     # cap at 5 lines
+            try:
+                lb = draw.textbbox((0, 0), ln, font=font_body)
+                lw = lb[2] - lb[0]
+            except Exception:
+                lw = len(ln) * 18
+            lx = (res_w - lw) // 2
+            # Soft shadow
+            draw.text((lx + 2, body_y + 2), ln, font=font_body,
+                      fill=(0, 0, 0, 160))
+            draw.text((lx, body_y), ln, font=font_body,
+                      fill=(220, 220, 220, 255))
+            body_y += body_line_h
+
+    # ── Bottom hint arrow ─────────────────────────────────────────────────
+    arrow = "▼"
+    try:
+        ab = draw.textbbox((0, 0), arrow, font=font_arrow)
+        aw = ab[2] - ab[0]
+    except Exception:
+        aw = 40
+    ax = (res_w - aw) // 2
+    ay = res_h - 200
+    draw.text((ax, ay), arrow, font=font_arrow, fill=(255, 210, 0, 200))
+
+    # ── Save ──────────────────────────────────────────────────────────────
+    card.convert("RGB").save(output_png, "PNG")
+    return os.path.exists(output_png) and os.path.getsize(output_png) > 100
+
+
 def create_intro_video(clip_dir: str, thumbnail_path: str,
                        voiceover_data: dict, hook_text: str,
                        logo_path: str, logo_size: int,
                        logo_position: str, logo_opacity: float,
                        res_w: int, res_h: int) -> str:
     """
-    Buat video intro:
-    - Background: thumbnail (blur + darken)
+    Buat video intro dengan creative Pillow-rendered card:
+    - Background: thumbnail (heavy blur + darken) atau dark gradient
+    - Hook text besar dengan keyword highlight kuning (word-level)
+    - Intro commentary text di bawah hook
     - Audio: TTS voiceover intro
-    - Text: hook text overlay
-    - Logo overlay
+    - Logo overlay (opsional)
     """
-    intro_audio = voiceover_data.get("intro_audio", "")
+    intro_audio    = voiceover_data.get("intro_audio", "")
     intro_duration = voiceover_data.get("intro_duration", 0)
-    intro_text = voiceover_data.get("intro_text", "")
+    intro_text     = voiceover_data.get("intro_text", "")
 
     if not intro_audio or not os.path.exists(intro_audio) or intro_duration <= 0:
         return ""
 
     intro_path = os.path.join(clip_dir, "intro.mp4")
 
-    # Build video filter for thumbnail background
-    vf_parts = []
+    # ── Step 1: Render intro card PNG with Pillow ─────────────────────────
+    card_png = os.path.join(clip_dir, "intro_card.png")
+    card_ok  = _render_intro_card(
+        hook_text=hook_text,
+        intro_text=intro_text,
+        thumbnail_path=thumbnail_path,
+        res_w=res_w, res_h=res_h,
+        output_png=card_png,
+    )
 
-    if thumbnail_path and os.path.exists(thumbnail_path):
-        # Thumbnail: scale, blur, darken
-        bg_filter = f"scale={res_w}:{res_h}:force_original_aspect_ratio=increase,crop={res_w}:{res_h},gblur=sigma=20,eq=brightness=-0.3"
-        input_args = ["-loop", "1", "-i", thumbnail_path]
+    # ── Step 2: Compose intro video (loop card PNG + audio) ───────────────
+    if card_ok:
+        input_args = ["-loop", "1", "-i", card_png]
+        vf_string  = "null"   # PNG already fully rendered
     else:
-        # Fallback: dark gradient background
-        bg_filter = "null"
-        input_args = ["-f", "lavfi", "-i", f"color=c=0x1a1a2e:s={res_w}x{res_h}:d={intro_duration + 1}:r=30"]
-
-    vf_parts.append(bg_filter)
-
-    # Hook text overlay (centered, large)
-    if hook_text:
-        safe_hook = escape_ffmpeg_text(hook_text)
-        vf_parts.append(
-            f"drawtext=text='{safe_hook}'"
-            f":fontsize=44:fontcolor=yellow"
-            f":x=(w-text_w)/2:y=(h-text_h)/2-60"
-            f":box=1:boxcolor=black@0.7:boxborderw=20"
-        )
-
-    # Intro commentary text (smaller, below hook)
-    if intro_text and len(intro_text) < 120:
-        safe_intro = escape_ffmpeg_text(intro_text[:100])
-        vf_parts.append(
-            f"drawtext=text='{safe_intro}'"
-            f":fontsize=28:fontcolor=white"
-            f":x=(w-text_w)/2:y=(h-text_h)/2+60"
-            f":box=1:boxcolor=black@0.5:boxborderw=12"
-        )
-
-    vf_string = ",".join(vf_parts) if vf_parts else "null"
+        # Fallback: plain dark background
+        input_args = ["-f", "lavfi",
+                      "-i", f"color=c=0x0d0d1a:s={res_w}x{res_h}:d={intro_duration + 1}:r=30"]
+        vf_string  = "null"
 
     cmd = [
         "ffmpeg", "-y",
@@ -251,14 +426,14 @@ def create_intro_video(clip_dir: str, thumbnail_path: str,
         "-pix_fmt", "yuv420p",
         intro_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    subprocess.run(cmd, capture_output=True, text=True)
 
     if os.path.exists(intro_path) and os.path.getsize(intro_path) > 1000:
-        # Add logo if specified
+        # Add logo overlay if specified
         if logo_path and os.path.exists(logo_path):
             with_logo = os.path.join(clip_dir, "intro_logo.mp4")
             if overlay_logo(intro_path, logo_path, with_logo,
-                          logo_size, logo_position, logo_opacity):
+                            logo_size, logo_position, logo_opacity):
                 safe_remove(intro_path)
                 os.rename(with_logo, intro_path)
         return intro_path
@@ -411,63 +586,212 @@ def overlay_logo(video_path: str, logo_path: str, output_path: str,
     return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
 
 
-def merge_parts(intro_path: str, main_path: str, outro_path: str,
-                output_path: str):
-    """Merge intro + main clip + outro menggunakan ffmpeg concat."""
-    parts = []
+def _create_title_card(title: str, source_label: str,
+                       output_path: str,
+                       res_w: int = 1080, res_h: int = 1920,
+                       duration: float = 1.8) -> bool:
+    """
+    Render a short title-card video (Pillow PNG → FFmpeg loop).
+    Shown between segments in --combine compilation.
+    Design: black background, large bold title with keyword highlight, source label.
+    """
+    from PIL import Image, ImageDraw
+
+    card = Image.new("RGB", (res_w, res_h), (8, 8, 12))
+    draw = ImageDraw.Draw(card)
+
+    font_title  = _load_subtitle_font(68)
+    font_source = _load_subtitle_font(30)
+    PAD = 70
+
+    # Yellow left accent bar
+    draw.rectangle([(PAD, res_h // 2 - 160), (PAD + 6, res_h // 2 + 160)],
+                   fill=(255, 210, 0))
+
+    # Title words with keyword highlight (word-by-word, centered block)
+    title_words = (title or "").split()
+    words_per_line = 4
+    title_lines = [title_words[i:i + words_per_line]
+                   for i in range(0, len(title_words), words_per_line)]
+
+    line_h = int(68 * 1.4)
+    total_h = len(title_lines) * line_h
+    start_y = res_h // 2 - total_h // 2 - 30
+    outline  = 3
+
+    for li, line_words in enumerate(title_lines):
+        # Measure total line width
+        parts, total_w, sp_w = [], 0, 16
+        for idx, wd in enumerate(line_words):
+            try:
+                wb = draw.textbbox((0, 0), wd, font=font_title)
+                ww = wb[2] - wb[0]
+            except Exception:
+                ww = len(wd) * 32
+            parts.append((wd, ww, _is_keyword(wd)))
+            total_w += ww + (sp_w if idx < len(line_words) - 1 else 0)
+
+        x = (res_w - total_w) // 2
+        y = start_y + li * line_h
+        for wd, ww, is_kw in parts:
+            fg = (255, 215, 0) if is_kw else (255, 255, 255)
+            for dx in range(-outline, outline + 1):
+                for dy in range(-outline, outline + 1):
+                    if dx or dy:
+                        draw.text((x + dx, y + dy), wd, font=font_title,
+                                  fill=(0, 0, 0))
+            draw.text((x, y), wd, font=font_title, fill=fg)
+            x += ww + sp_w
+
+    # Source label
+    if source_label:
+        try:
+            sb = draw.textbbox((0, 0), source_label, font=font_source)
+            sw = sb[2] - sb[0]
+        except Exception:
+            sw = len(source_label) * 15
+        draw.text(((res_w - sw) // 2, start_y + total_h + 24),
+                  source_label, font=font_source, fill=(160, 160, 160))
+
+    # Save PNG
+    png_path = output_path.replace(".mp4", "_card.png")
+    card.save(png_path, "PNG")
+
+    # PNG → short silent video
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", png_path,
+        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "64k",
+        "-t", str(duration),
+        "-shortest",
+        output_path
+    ]
+    subprocess.run(cmd, capture_output=True)
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 500
+
+
+def concat_clips(paths: list, output_path: str) -> bool:
+    """
+    Encode all clips to a uniform format then concatenate into output_path.
+    Handles N clips (generalised version of merge_parts).
+    Returns True on success.
+    """
+    if not paths:
+        return False
+    if len(paths) == 1:
+        shutil.copy2(paths[0], output_path)
+        return True
+
+    work_dir   = os.path.dirname(output_path)
     temp_files = []
-
-    if intro_path and os.path.exists(intro_path):
-        parts.append(intro_path)
-
-    parts.append(main_path)
-
-    if outro_path and os.path.exists(outro_path):
-        parts.append(outro_path)
-
-    if len(parts) == 1:
-        shutil.copy2(parts[0], output_path)
-        return
-
-    # Re-encode semua parts ke format yang sama sebelum concat
     normalized = []
-    for i, part in enumerate(parts):
-        norm_path = output_path + f"_norm_{i}.mp4"
+
+    for i, part in enumerate(paths):
+        if not part or not os.path.exists(part):
+            continue
+        norm = os.path.join(work_dir, f"_norm_{i}.mp4")
         cmd = [
             "ffmpeg", "-y", "-i", part,
             "-c:v", "libx264", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-            "-r", "30",
+            "-c:a", "aac", "-b:a", "128k",
+            "-ar", "44100", "-ac", "2", "-r", "30",
             "-pix_fmt", "yuv420p",
-            norm_path
+            norm
         ]
         subprocess.run(cmd, capture_output=True)
-        if os.path.exists(norm_path) and os.path.getsize(norm_path) > 500:
-            normalized.append(norm_path)
-            temp_files.append(norm_path)
+        if os.path.exists(norm) and os.path.getsize(norm) > 500:
+            normalized.append(norm)
+            temp_files.append(norm)
         else:
             normalized.append(part)
 
-    # Concat
-    concat_list = output_path + "_concat.txt"
-    with open(concat_list, "w") as f:
-        for part in normalized:
-            f.write(f"file '{os.path.abspath(part)}'\n")
+    concat_txt = output_path + "_list.txt"
+    with open(concat_txt, "w") as f:
+        for p in normalized:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+    temp_files.append(concat_txt)
 
     cmd = [
         "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_list,
+        "-f", "concat", "-safe", "0", "-i", concat_txt,
         "-c:v", "libx264", "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k",
         output_path
     ]
     subprocess.run(cmd, capture_output=True)
-    temp_files.append(concat_list)
 
-    # Cleanup
     for f in temp_files:
         safe_remove(f)
+
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+
+
+def create_compilation(segments: list, output_path: str,
+                       intro_path: str = "",
+                       res_w: int = 1080, res_h: int = 1920) -> bool:
+    """
+    Gabungkan segment clips menjadi satu video compilation (mode --combine).
+
+    segments: list of {
+        "path": str,        # path to burned-subtitle styled.mp4
+        "title": str,       # clip title (for title card)
+        "source": str,      # source channel label
+        "clip_number": int
+    }
+
+    Structure of final output:
+      [intro] → [title card 1] → [segment 1] → [title card 2] → [segment 2] → ...
+    """
+    work_dir = os.path.dirname(output_path)
+    parts    = []
+    temps    = []
+
+    if intro_path and os.path.exists(intro_path):
+        parts.append(intro_path)
+
+    for i, seg in enumerate(segments):
+        seg_path = seg.get("path", "")
+        if not seg_path or not os.path.exists(seg_path):
+            print(f"    [WARN] Segment {seg.get('clip_number','?')} tidak ditemukan, dilewati")
+            continue
+
+        # Title card
+        tc_path = os.path.join(work_dir, f"_tc_{i:03d}.mp4")
+        if _create_title_card(
+            title=seg.get("title", ""),
+            source_label=seg.get("source", ""),
+            output_path=tc_path,
+            res_w=res_w, res_h=res_h,
+            duration=1.8
+        ):
+            parts.append(tc_path)
+            temps.append(tc_path)
+
+        parts.append(seg_path)
+
+    if not parts:
+        return False
+
+    ok = concat_clips(parts, output_path)
+
+    for t in temps:
+        safe_remove(t)
+
+    return ok
+
+
+def merge_parts(intro_path: str, main_path: str, outro_path: str,
+                output_path: str):
+    """Merge intro + main clip + outro menggunakan concat_clips."""
+    parts = []
+    if intro_path and os.path.exists(intro_path):
+        parts.append(intro_path)
+    parts.append(main_path)
+    if outro_path and os.path.exists(outro_path):
+        parts.append(outro_path)
+    concat_clips(parts, output_path)
 
 
 def _ass_time(seconds: float) -> str:

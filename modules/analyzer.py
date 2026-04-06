@@ -82,7 +82,7 @@ FORMAT OUTPUT: JSON array saja, tanpa markdown.
 ]"""
 
     # Call LLM
-    response_text = call_llm(prompt, provider, api_key, model)
+    response_text = call_llm(prompt, provider, api_key, model, max_clips=max_clips)
 
     # Parse JSON dari response
     clips = parse_llm_response(response_text)
@@ -129,12 +129,26 @@ def analyze_multi_transcripts(transcripts: list, videos_meta: list,
     if context:
         print(f"    Context: {context}")
 
-    # Gabung semua transkripsi dengan label video
+    # Gabung semua transkripsi dengan label video.
+    # Batasi tiap video secara proporsional agar video kecil tidak terpotong habis
+    # oleh video besar. Setiap video mendapat kuota chars yang sama.
+    MAX_TRANSCRIPT_CHARS = 22000   # total chars untuk semua transcript di prompt
+    chars_per_video = MAX_TRANSCRIPT_CHARS // max(len(transcripts), 1)
+
     combined_text = ""
     for i, (transcript, meta) in enumerate(zip(transcripts, videos_meta)):
-        source_idx = meta.get("source_index", i + 1)
-        combined_text += f"\n\n=== VIDEO {source_idx}: {meta.get('title', 'Unknown')} (Channel: {meta.get('channel', 'Unknown')}) ===\n"
-        combined_text += format_segments_for_prompt(transcript["segments"])
+        source_idx  = meta.get("source_index", i + 1)
+        full_text   = format_segments_for_prompt(transcript["segments"])
+        # Potong di batas baris agar tidak putus di tengah kalimat
+        if len(full_text) > chars_per_video:
+            cut = full_text.rfind("\n", 0, chars_per_video)
+            full_text = full_text[:cut if cut > 0 else chars_per_video] + \
+                        "\n[... sisa transcript dipotong untuk efisiensi ...]"
+        combined_text += (
+            f"\n\n=== VIDEO {source_idx}: {meta.get('title', 'Unknown')}"
+            f" (Channel: {meta.get('channel', 'Unknown')}) ===\n"
+        )
+        combined_text += full_text
 
     context_instruction = ""
     if context:
@@ -162,6 +176,7 @@ ATURAN CLIP:
 3. Pastikan clip dimulai dan diakhiri di titik yang natural
 4. Setiap clip harus bisa berdiri sendiri
 5. SERTAKAN field "source_video" berisi nomor video asal (1, 2, 3, ...)
+6. WAJIB: distribusikan clip secara merata dari SEMUA video. Jika ada {len(transcripts)} video, minimal {max(1, max_clips // len(transcripts))} clip dari tiap video
 
 UNTUK SETIAP CLIP, BERIKAN:
 - clip_number, source_video (nomor video asal), title (catchy, Bahasa Indonesia jika video berbahasa Indonesia)
@@ -180,7 +195,7 @@ FORMAT OUTPUT: JSON array saja, tanpa markdown.
   ...
 ]"""
 
-    response_text = call_llm(prompt, provider, api_key, model)
+    response_text = call_llm(prompt, provider, api_key, model, max_clips=max_clips)
     clips = parse_llm_response(response_text)
     print(f"    [DEBUG] LLM returned {len(clips)} clips sebelum validasi durasi")
 
@@ -255,22 +270,26 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def call_llm(prompt: str, provider: str, api_key: str, model: str) -> str:
+def call_llm(prompt: str, provider: str, api_key: str, model: str,
+             max_clips: int = 10) -> str:
     """Call LLM API dan return response text."""
 
     # Truncate prompt jika terlalu panjang.
-    # Dengan kompresi window-20s, video 2 jam pun masuk di bawah 30k chars.
     MAX_PROMPT_CHARS = 32000
     est_tokens = len(prompt) // 4
     print(f"    [INFO] Prompt size: {len(prompt):,} chars (~{est_tokens:,} tokens)")
     if len(prompt) > MAX_PROMPT_CHARS:
-        # Potong di batas baris agar tidak putus di tengah kalimat
         cut_pos = prompt.rfind("\n", 0, MAX_PROMPT_CHARS)
-        if cut_pos < MAX_PROMPT_CHARS * 0.8:
+        if cut_pos < int(MAX_PROMPT_CHARS * 0.8):
             cut_pos = MAX_PROMPT_CHARS
         print(f"    [INFO] Dipotong ke {cut_pos:,} chars")
-        prompt = prompt[:cut_pos] + "\n\n[TRANSCRIPT DIPOTONG]\n\n" + \
-                 prompt[prompt.rfind("\nATURAN CLIP"):]   # Tetap sertakan aturan & format output
+        # Cari bagian ATURAN CLIP untuk di-append kembali setelah potongan
+        rules_pos = prompt.rfind("\nATURAN CLIP")
+        rules_tail = prompt[rules_pos:] if rules_pos > 0 else ""
+        prompt = prompt[:cut_pos] + "\n\n[TRANSCRIPT DIPOTONG]\n\n" + rules_tail
+
+    # Estimasi max_tokens output: ~400 token per clip, minimum 2048, maksimum 8000
+    out_tokens = max(2048, min(400 * max_clips, 8000))
 
     try:
         if provider == "openai":
@@ -283,7 +302,7 @@ def call_llm(prompt: str, provider: str, api_key: str, model: str) -> str:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                max_tokens=4096,
+                max_tokens=out_tokens,
                 response_format={"type": "json_object"} if "gpt-4" in model else None
             )
             return response.choices[0].message.content
@@ -293,7 +312,7 @@ def call_llm(prompt: str, provider: str, api_key: str, model: str) -> str:
             client = anthropic.Anthropic(api_key=api_key)
             response = client.messages.create(
                 model=model,
-                max_tokens=4096,
+                max_tokens=out_tokens,
                 system="Kamu adalah content strategist YouTube. WAJIB output JSON array valid saja, tanpa teks, tanpa markdown, tanpa penjelasan apapun sebelum atau sesudah JSON.",
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -308,14 +327,24 @@ def call_llm(prompt: str, provider: str, api_key: str, model: str) -> str:
 
 
 def parse_llm_response(text: str) -> list:
-    """Parse JSON dari LLM response (handle markdown code blocks dll)."""
+    """
+    Parse JSON dari LLM response dengan beberapa fallback:
+    1. Direct parse
+    2. Strip markdown fences
+    3. Regex extract [...]
+    4. Salvage truncated array (response cut off mid-JSON)
+    """
     import re
 
     text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
 
+    # Strip markdown code fences
+    if "```" in text:
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```.*$", "", text, flags=re.MULTILINE)
+        text = text.strip()
+
+    # 1. Direct parse
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "clips" in data:
@@ -326,12 +355,29 @@ def parse_llm_response(text: str) -> list:
     except json.JSONDecodeError:
         pass
 
+    # 2. Extract [...] block
     match = re.search(r'\[.*\]', text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
         except json.JSONDecodeError:
             pass
+
+    # 3. Salvage truncated array — response was cut off before closing ]
+    # Strategy: find the last complete object (ends with }) and close the array
+    start = text.find('[')
+    if start >= 0:
+        fragment = text[start:]
+        last_brace = fragment.rfind('}')
+        if last_brace > 0:
+            salvaged = fragment[:last_brace + 1].rstrip().rstrip(',') + '\n]'
+            try:
+                data = json.loads(salvaged)
+                if isinstance(data, list) and data:
+                    print(f"    [INFO] JSON dipotong — berhasil salvage {len(data)} clip(s) dari response tidak lengkap")
+                    return data
+            except json.JSONDecodeError:
+                pass
 
     print("    [WARNING] Gagal parse LLM response sebagai JSON")
     print(f"    [DEBUG] Raw response (100 chars): {text[:100]!r}")

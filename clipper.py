@@ -37,7 +37,8 @@ from modules.downloader import download_video, download_multiple
 from modules.transcriber import transcribe_video
 from modules.analyzer import analyze_transcript, analyze_multi_transcripts
 from modules.tts_engine import generate_clip_voiceovers
-from modules.video_editor import create_clip
+from modules.video_editor import create_clip, create_compilation, create_intro_video
+from modules.tts_engine import generate_voiceover, get_audio_duration
 
 import config
 
@@ -63,6 +64,17 @@ def parse_args():
             '  --context "highlight insight tentang startup"'
         )
     )
+    parser.add_argument(
+        "--combine",
+        action="store_true",
+        default=False,
+        help=(
+            "Gabungkan potongan terbaik dari SEMUA video sumber menjadi\n"
+            "SATU video compilation. Cocok untuk momen lucu/highlight\n"
+            "dari beberapa video yang dikombinasikan.\n"
+            "Contoh: python clipper.py <url1> <url2> --combine --context \"momen lucu\""
+        )
+    )
     return parser.parse_args()
 
 
@@ -71,8 +83,9 @@ def main():
     args = parse_args()
 
     # ─── Kumpulkan URL ────────────────────────────────────
-    urls = args.urls
+    urls    = args.urls
     context = args.context.strip()
+    combine = args.combine
 
     # Default context jika tidak diisi
     if not context:
@@ -106,6 +119,8 @@ def main():
         print(f"\n🎯 Context: {context}")
     if is_multi:
         print(f"🔗 Multi-video mode: {len(valid_urls)} video akan digabung")
+    if combine:
+        print(f"🎞️  Combine mode: momen terbaik dari semua video → 1 video compilation")
 
     # ─── Validate API key ─────────────────────────────────
     api_key = get_api_key()
@@ -185,25 +200,34 @@ def main():
     print("🧠 STEP 3: AI Analisis - Cari Momen Penting")
     print("=" * 60)
 
+    # Combine mode: request shorter segments, more of them, from multiple sources
+    clip_min = 15 if combine else config.CLIP_MIN_DURATION
+    clip_max = 35 if combine else config.CLIP_MAX_DURATION
+    max_clips = config.MAX_CLIPS   # sama untuk semua mode; combine cukup pakai durasi lebih pendek
+    combine_hint = (
+        " PENTING: pilih momen dari BERBAGAI video sumber yang berbeda "
+        "(bukan dari satu video saja). Variasikan sumber video."
+    ) if combine and is_multi else ""
+
     if is_multi:
         clips_data = analyze_multi_transcripts(
             transcripts=transcripts,
             videos_meta=videos_meta,
-            max_clips=config.MAX_CLIPS,
-            clip_min_duration=config.CLIP_MIN_DURATION,
-            clip_max_duration=config.CLIP_MAX_DURATION,
+            max_clips=max_clips,
+            clip_min_duration=clip_min,
+            clip_max_duration=clip_max,
             provider=config.LLM_PROVIDER,
             api_key=api_key,
             model=config.LLM_MODEL,
-            context=context
+            context=context + combine_hint
         )
     else:
         clips_data = analyze_transcript(
             transcript=transcripts[0],
             video_meta=videos_meta[0],
-            max_clips=config.MAX_CLIPS,
-            clip_min_duration=config.CLIP_MIN_DURATION,
-            clip_max_duration=config.CLIP_MAX_DURATION,
+            max_clips=max_clips,
+            clip_min_duration=clip_min,
+            clip_max_duration=clip_max,
             provider=config.LLM_PROVIDER,
             api_key=api_key,
             model=config.LLM_MODEL,
@@ -245,19 +269,21 @@ def main():
     print("=" * 60)
 
     clips_dir = os.path.join(session_dir, "clips")
+    os.makedirs(clips_dir, exist_ok=True)
     final_clips = []
 
     for clip in clips_data:
         clip_num = clip["clip_number"]
-        vo_data = voiceovers.get(clip_num, {})
+        vo_data  = voiceovers.get(clip_num, {})
 
-        # Tentukan video sumber untuk multi-video mode
+        # Tentukan video sumber
         src_video_idx = clip.get("source_video", 1)
         src_meta = next(
             (v for v in videos_meta if v.get("source_index") == src_video_idx),
             videos_meta[0]
         )
-        src_transcript = transcripts[videos_meta.index(src_meta)] if src_meta in videos_meta else transcripts[0]
+        src_transcript = (transcripts[videos_meta.index(src_meta)]
+                          if src_meta in videos_meta else transcripts[0])
 
         clip_path = create_clip(
             video_path=src_meta["video_path"],
@@ -277,15 +303,125 @@ def main():
             logo_position=config.LOGO_POSITION,
             logo_opacity=config.LOGO_OPACITY,
             outro_cta_text=config.OUTRO_CTA_TEXT,
-            outro_duration=config.OUTRO_DURATION
+            outro_duration=config.OUTRO_DURATION,
+            compile_mode=combine,   # skip per-clip intro/merge when combining
         )
 
         final_clips.append({
             "clip_number": clip_num,
             "path": clip_path,
             "source_video": src_video_idx,
+            "source_channel": src_meta.get("channel", ""),
             "data": clip
         })
+
+    # ═════════════════════════════════════════════════════
+    # STEP 5.5 (combine mode): build compilation videos
+    # ═════════════════════════════════════════════════════
+    if combine:
+        print("\n" + "=" * 60)
+        print("🎞️  STEP 5.5: Membuat Compilation Videos")
+        print("=" * 60)
+
+        res_w = 1080 if config.CLIP_FORMAT == "vertical" else 1920
+        res_h = 1920 if config.CLIP_FORMAT == "vertical" else 1080
+
+        # Collect valid segments (include clip metadata for per-compilation intro)
+        segments = []
+        for fc in final_clips:
+            if fc["path"] and os.path.exists(fc["path"]):
+                segments.append({
+                    "path":              fc["path"],
+                    "title":             fc["data"].get("title", ""),
+                    "source":            fc["source_channel"],
+                    "clip_number":       fc["clip_number"],
+                    "viral_score":       fc["data"].get("viral_score", 5),
+                    "hook":              fc["data"].get("hook", ""),
+                    "commentary_intro":  fc["data"].get("commentary_intro", ""),
+                })
+
+        if not segments:
+            print("    [WARNING] Tidak ada segment untuk digabung")
+        else:
+            # Split segments into groups of SEGMENTS_PER_COMPILATION
+            SEGMENTS_PER_COMP = 3
+            groups = [segments[i:i + SEGMENTS_PER_COMP]
+                      for i in range(0, len(segments), SEGMENTS_PER_COMP)]
+
+            print(f"    {len(segments)} segment → {len(groups)} compilation "
+                  f"(@{SEGMENTS_PER_COMP} segment per file)")
+
+            comp_dir = os.path.join(session_dir, "compilations")
+            os.makedirs(comp_dir, exist_ok=True)
+
+            for gi, group in enumerate(groups, start=1):
+                seg_labels = ", ".join(f"#{s['clip_number']}" for s in group)
+                print(f"\n    [Compilation {gi}/{len(groups)}] "
+                      f"{len(group)} segment: {seg_labels}")
+
+                intro_dir = os.path.join(comp_dir, f"comp_{gi:02d}_tmp")
+                os.makedirs(intro_dir, exist_ok=True)
+
+                # ── Build group-specific intro context ──────────────
+                # Hook: ambil dari clip dengan viral_score tertinggi di group
+                best = max(group, key=lambda s: s.get("viral_score", 0))
+                hook_text = best.get("hook", "") or context[:80] or "Momen Terbaik"
+
+                # Narasi: rangkum judul semua clip di group ini
+                titles = [s["title"] for s in group]
+                if len(titles) == 1:
+                    narration = f"Momen lucu yang bikin ngakak! {titles[0]}!"
+                elif len(titles) == 2:
+                    narration = (f"Dua momen paling lucu hari ini: "
+                                 f"{titles[0]}, dan {titles[1]}!")
+                else:
+                    narration = (f"Kumpulan momen lucu yang bikin ngakak! "
+                                 f"{titles[0]}, {titles[1]}, "
+                                 f"dan {titles[2]}!")
+
+                # Generate TTS khusus untuk compilation ini
+                print(f"      Hook     : {hook_text[:60]}")
+                print(f"      Narasi   : {narration[:60]}")
+                vo_audio = os.path.join(intro_dir, "comp_intro_vo.mp3")
+                try:
+                    generate_voiceover(narration, vo_audio,
+                                       config.TTS_VOICE, config.TTS_RATE)
+                    vo_dur = get_audio_duration(vo_audio)
+                except Exception as e:
+                    print(f"      [WARN] TTS gagal: {e}")
+                    vo_audio, vo_dur = "", 0.0
+
+                comp_vo_data = {
+                    "intro_audio":    vo_audio,
+                    "intro_duration": vo_dur,
+                    "intro_text":     narration,
+                    "hook_text":      hook_text,
+                }
+
+                # ── Buat intro card untuk compilation ini ───────────
+                comp_intro = create_intro_video(
+                    clip_dir=intro_dir,
+                    thumbnail_path=primary_meta.get("thumbnail_path", ""),
+                    voiceover_data=comp_vo_data,
+                    hook_text=hook_text,
+                    logo_path=config.LOGO_PATH,
+                    logo_size=config.LOGO_SIZE,
+                    logo_position=config.LOGO_POSITION,
+                    logo_opacity=config.LOGO_OPACITY,
+                    res_w=res_w, res_h=res_h,
+                )
+
+                comp_path = os.path.join(comp_dir, f"COMPILATION_{gi:02d}.mp4")
+                ok = create_compilation(
+                    segments=group,
+                    output_path=comp_path,
+                    intro_path=comp_intro,
+                    res_w=res_w, res_h=res_h,
+                )
+                if ok:
+                    print(f"    ✅ Compilation {gi:02d} selesai: {comp_path}")
+                else:
+                    print(f"    [WARNING] Compilation {gi:02d} gagal dibuat")
 
     # ═════════════════════════════════════════════════════
     # STEP 6: Review Package
@@ -304,6 +440,8 @@ def main():
     print("=" * 60)
     print(f"\n📁 Folder hasil : {os.path.abspath(session_dir)}")
     print(f"📋 Review checklist : {os.path.join(os.path.abspath(session_dir), 'REVIEW_CHECKLIST.md')}")
+    if combine:
+        print(f"🎞️  Compilations    : {os.path.join(os.path.abspath(session_dir), 'compilations/')}")
     print(f"🎬 Total clips      : {len(final_clips)}")
     print(f"\n💡 LANGKAH SELANJUTNYA:")
     print(f"   1. Tonton tiap clip di folder clips/")
@@ -449,11 +587,16 @@ def print_banner():
 ║    Single video:                                              ║
 ║      python clipper.py <url>                                  ║
 ║                                                               ║
-║    Multi video (digabung):                                    ║
+║    Multi video → clip terpisah:                               ║
 ║      python clipper.py <url1> <url2> <url3>                   ║
 ║                                                               ║
-║    Dengan context/arahan:                                     ║
-║      python clipper.py <url> --context "fokus tips bisnis"    ║
+║    Multi video → 1 compilation video:                         ║
+║      python clipper.py <url1> <url2> --combine                ║
+║                                                               ║
+║    Dengan context:                                            ║
+║      python clipper.py <url> --context "momen lucu"           ║
+║      python clipper.py <url1> <url2> --combine \\             ║
+║        --context "highlight lucu dari semua video"            ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
     """)
